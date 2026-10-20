@@ -1,93 +1,87 @@
 ---
-name: QQNT-chat-export-v2.2
-description: "提取Windows NTQQ（QQ NT）本地加密数据库中的聊天记录，支持密钥提取、数据库解密、C2C消息导出为TXT/Markdown/JSON三种格式。v2版本在执行前自动检查并安装所有依赖，提供统一入口脚本一键导出。当用户需要导出QQ聊天记录、解密QQ NT数据库、提取本地QQ消息历史时使用。全程命令行操作，无需GUI。关键技术点：密钥需用hex输出版脚本提取（ASCII版会损坏非ASCII字节）；解密必须用HMAC_SHA512（非教程中的SHA1）；QQNT_Export的UID映射有bug，需直接SQL查询绕过。"
-version: "2.2"
+name: QQNT-chat-export-v3
+description: "从Windows NTQQ（QQ NT）本地加密数据库中提取单聊聊天记录，支持密钥提取（静态分析+DLL调试器）、SQLCipher数据库解密、C2C消息导出为TXT/Markdown/JSON三种格式。v3完成重构：内置protobuf解码器（唯一pip依赖是sqlcipher3）、解密参数按数据库头部自动探测、静态分析用C#实现（0.3秒完成112MB文件）、支持WAL合并与端到端自测。当用户需要导出QQ聊天记录、解密QQ NT数据库、提取本地QQ消息历史、从wrapper.node提取数据库密钥时使用。全程命令行操作，无需GUI。关键技术点：QQ数据库头部声明HMAC_SHA1（不是SHA512）；密钥是16字节原始值而非hex文本；QQ拒绝第三方调试器附加（必须先退出QQ再由脚本启动）；.ps1必须带UTF-8 BOM。"
+version: "3.0"
 ---
 
-# QQ NT 聊天记录导出 v2
+# QQ NT 聊天记录导出 v3
 
-从Windows NTQQ本地加密数据库中提取完整聊天记录，导出为 **TXT / Markdown / JSON** 三种格式。
+从 Windows NTQQ 本地加密数据库中提取聊天记录，导出为 **TXT / Markdown / JSON**。
 
-**v2 特性**：
-- 一键部署脚本 `install.ps1`，在新电脑上自动安装 Python、下载 QQNT_Export、安装全部依赖
-- 执行前自动检查所有 Python 依赖，缺失则自动 pip 安装
-- 统一入口脚本 `run_export.ps1`，一条命令完成全流程
-- 自动检测当前登录的 QQ 账号（按 nt_msg.db 修改时间）
-- 支持 TXT / Markdown / JSON 三种输出格式，可单独或全部导出
+**v3 特性**：
+- 一键部署 `install.ps1`：装 Python、`sqlcipher3`（Windows 有官方 wheel），可选下载 QQNT_Export
+- 一键导出 `run_export.ps1`：依赖检查 → 密钥提取 → 账号识别 → 解密 → 导出
+- 消息体解析内置（`qq_elements.py`），**不再依赖 protobuf / lxml / SQLAlchemy / pillow 等**
+- 解密参数从数据库头部读取 + 自动探测，密钥以原始字节传递
+- 静态分析改为 C# 实现，112 MB 的 `wrapper.node` 0.3 秒完成
+- `-ListPeers` 直接列出会话；`selftest.py` 13 项端到端自测
 
 ## 部署到新电脑（首次使用）
 
-在一台全新的 Windows 电脑上，只需运行部署脚本即可完成全部环境配置：
-
 ```powershell
-# 解压 zip 后进入 scripts 目录
 cd scripts
 powershell -ExecutionPolicy Bypass -File install.ps1
 ```
 
-`install.ps1` 会自动完成：
-1. **检查/安装 Python 3.8+** — 优先用 winget，失败则从 python.org 下载官方安装包（用户级静默安装）
-2. **下载 QQNT_Export** — 从 GitHub（https://github.com/Tealina28/QQNT_Export）下载并解压到桌面 `QQNT_output\QQNT_Export`
-3. **安装全部 Python 依赖** — protobuf、tqdm、lxml、humanize、SQLAlchemy、jinja2、pillow、mutagen，以及 sqlcipher3（优先预编译的 sqlcipher3-binary）
-4. **验证安装** — 逐项检查导入是否成功，输出通过/失败清单
+`install.ps1` 会：
+1. 检查/安装 Python 3.8+（优先 winget，失败则官方安装包静默安装；用真实 `--version` 验证，绕开商店假 python）
+2. 安装 `sqlcipher3`（**不要用 `sqlcipher3-binary`：它只有 manylinux 轮子，Windows 上永远装不上**）
+3. 可选下载 QQNT_Export（仅用于表情中文名）
+4. 汇总 Python / sqlcipher3 / QQNT_Export / QQ NT / QQ 数据目录
 
-参数：
-- `-QQNTExportDir`：自定义 QQNT_Export 安装路径
-- `-PythonVersion`：指定 Python 版本（默认 3.12）
-- `-SkipPython`：跳过 Python 安装检查
+参数：`-DryRun`（只检查）、`-QQNTExportDir`、`-PythonVersion`、`-Python`、`-SkipPython`、`-SkipQQNTExport`。
 
-部署完成后，再运行 `run_export.ps1` 导出聊天记录。
-
-> **注意**：QQ NT 客户端本身需自行安装并登录目标账号，install.ps1 不包含 QQ 客户端的安装。
+> **注意**：QQ NT 客户端需自行安装并登录；`install.ps1` 不安装 QQ。
 
 ## 快速开始（推荐）
 
 ```powershell
-# 进入 scripts 目录后运行
 cd scripts
+powershell -ExecutionPolicy Bypass -File run_export.ps1 -ListPeers      # ① 看有哪些会话
+# ② 完全退出 QQ（托盘右键退出）
 powershell -ExecutionPolicy Bypass -File run_export.ps1 -PeerQQ 1361750460
 ```
 
 参数说明：
-- `-PeerQQ`（必填）：对方 QQ 号
-- `-MyQQ`（可选）：自己的 QQ 号，省略则自动检测
-- `-Format`（可选）：`all`（默认，三种格式全出）/ `txt` / `md` / `json`
-- `-OutputDir`（可选）：输出目录，默认当前目录
-- `-QQNTExport`（可选）：QQNT_Export 目录路径
-- `-SkipDepsCheck`（可选）：跳过依赖检查（不推荐）
+- `-PeerQQ`：对方 QQ 号（配合 `-ListPeers` 查）
+- `-MyQQ`：自己的 QQ 号，省略则自动检测（按 `nt_msg.db` 最近活动时间）
+- `-Format`：`all`（默认）/ `txt` / `md` / `json`，可逗号组合
+- `-OutputDir`：输出目录，默认当前目录
+- `-Key`：直接给密钥，跳过提取
+- `-DecryptedDb`：直接用已解密的 `nt_msg.db`，跳过提取与解密
+- `-Python`、`-QQNTExport`、`-TencentFiles`：覆盖自动探测
+- `-AllDatabases`：解密全部库（默认只解 `nt_msg.db`）
+- `-Force`：强制重解（默认源库更新时才重解）
+- `-ListPeers`、`-SkipDepsCheck`、`-TimeoutSeconds`
 
-示例：
-```powershell
-# 只导出 Markdown 到指定目录
-.\run_export.ps1 -PeerQQ 1361750460 -Format md -OutputDir D:\export
-
-# 指定自己的账号，导出全部三种格式
-.\run_export.ps1 -PeerQQ 1361750460 -MyQQ 3052607264 -Format all
-```
+退出码：`0` 成功 / `1` 环境问题 / `2` 参数错误 / `3` 密钥提取失败 / `4` 解密失败。
 
 ## 输出格式说明
 
 ### TXT
-原始聊天记录风格，按日期分组，每条含时间戳、收发方向和内容：
+
 ```
+QQ聊天记录 - 与 1361750460
+共 121 条消息
+时间范围: 2023-03-18 18:39:01 ~ 2026-10-17 17:02:55
+导出时间: 2026-10-20 18:39:17
+============================================================
+
 ===== 2024-01-27 =====
 
-2024-01-27 19:33:06 发
+2024-01-27 19:33:06 收
 [文本]
 不是我买
-
-2024-01-27 19:33:16 收
-[文本]
-那干啥
 ```
 
 ### Markdown
-适合在笔记软件、GitHub、Obsidian 中阅读，含按年统计表和日期分组：
+
 ```markdown
 # QQ 聊天记录 — 与 1361750460
 
 - **消息总数**：1768 条
-- **时间范围**：2024-01-27 ~ 2026-10-14
+- **时间范围**：2024-01-27 19:33:06 ~ 2026-10-14 15:13:38
+- **数据来源**：`nt_msg.db`
 
 ## 按年统计
 | 年份 | 消息数 |
@@ -96,30 +90,33 @@ powershell -ExecutionPolicy Bypass -File run_export.ps1 -PeerQQ 1361750460
 
 ## 2024-01-27
 
-**19:33:06 我**：不是我买
-**19:33:16 对方**：那干啥
+**19:33:06 对方**：不是我买
 ```
 
 ### JSON
-结构化数据，适合程序处理、数据分析或导入其他工具：
+
 ```json
 {
   "meta": {
+    "generator": "QQNT-chat-export v3.0.0",
     "my_qq": "3052607264",
     "peer_qq": "1361750460",
     "total": 1768,
     "date_range": {"start": "2024-01-27 19:33:06", "end": "2026-10-14 15:13:38"},
-    "exported_at": "2026-10-17 12:00:00"
+    "exported_at": "2026-10-20 18:39:17",
+    "source_db": "nt_msg.db",
+    "stats": {"by_year": {"2024": 572}, "by_type": {"文本": 1600}, "by_direction": {"收": 900, "发": 868}}
   },
   "messages": [
     {
+      "id": "7399284464009183099",
       "timestamp": "2024-01-27 19:33:06",
       "date": "2024-01-27",
       "time": "19:33:06",
-      "direction": "sent",
-      "direction_cn": "发",
+      "direction": "received",
+      "direction_cn": "收",
       "type": "文本",
-      "content": "不是我买",
+      "content": "[文本]\n不是我买",
       "elements": [{"label": "[文本]", "content": "不是我买"}]
     }
   ]
@@ -128,126 +125,120 @@ powershell -ExecutionPolicy Bypass -File run_export.ps1 -PeerQQ 1361750460
 
 ## 手动分步执行
 
-如果需要分步调试，可按以下步骤手动执行。
+### 第一步：检查依赖
 
-### 第一步：检查依赖（v2 新增）
-
-```bash
-python scripts/check_deps.py
+```powershell
+python scripts/check_deps.py            # 缺失会自动 pip 安装
+python scripts/check_deps.py --no-install
+python scripts/check_deps.py --json
 ```
 
-检查项：
-- Python 版本 >= 3.8
-- 必需包：sqlcipher3、protobuf==6.31.1、tqdm、lxml、humanize、SQLAlchemy、jinja2、pillow、mutagen
-- QQNT_Export 目录及 element_pb2.py
-- QQ NT 安装位置
-
-缺失的包会自动通过 pip 安装。使用 `--no-install` 只检查不安装，`--qqnt-export PATH` 指定 QQNT_Export 路径。
+检查项：Python ≥ 3.8、`sqlcipher3`（必需）、QQNT_Export（可选）、QQ NT 安装、Tencent Files 与账号。
 
 ### 第二步：提取数据库密钥
 
-运行hex输出版密钥提取脚本（QQ需处于登录状态）：
+**先完全退出 QQ**，然后：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/get_key_hex.ps1
 ```
 
 脚本会：
-1. 自动定位QQ安装目录和`wrapper.node`
-2. 静态分析找到`nt_sqlite3_key_v2`函数的RVA
-3. 启动QQ并附加调试器，在函数入口断点评测R8寄存器中的密钥
-4. 输出十六进制密钥
+1. 自动定位 QQ 安装目录与 `wrapper.node`（注册表 + config.json + 常见路径）
+2. 静态分析：`.rdata` 找 `nt_sqlite3_key_v2: db=%p zDb=%s` → `.text` 扫 RIP-relative LEA → `.pdata` 定位函数 RVA（C#，约 0.3 秒）
+3. 以调试方式启动 `QQ.exe`，在函数入口下断点
+4. 命中后从 `R8`（pKey）与 `R9`（nKey）读取密钥
 
-**注意**：原始教程中的脚本用`Encoding.ASCII.GetString`读取密钥，会将非ASCII字节替换为`?`。必须使用本skill中的hex输出版本。
+常用参数：
+- `-NoDebugForKey`：只做静态分析（验证 QQ 版本是否仍支持）
+- `-OutFile <path>`：把密钥写进文件
+- `-Quiet` / `-AsJson`：只输出密钥 / JSON
+- `-Attach`：附加到已运行的 QQ（QQ 通常会拒绝，返回错误 31）
+- `-TimeoutSeconds`：等待断点的时间（默认 180 秒）
+- `-FunctionRva` / `-ModuleName` / `-QQExePath`：高级覆盖
 
-如果QQ自动登录的不是目标账号，需要用户手动切换账号登录后再运行脚本。
+**注意**：密钥是 16 字节原始值，可能包含 `?`（0x3F）等字符。请直接使用 hex 字符串，不要手工转 ASCII。
 
 ### 第三步：解密数据库
 
-```bash
+```powershell
 python scripts/decrypt_db.py <QQ号> <密钥>
+python scripts/decrypt_db.py <QQ号> <密钥> --only nt_msg.db     # 只解消息库（最快）
+python scripts/decrypt_db.py <QQ号> --list                     # 查看库与头部信息
 ```
 
-参数：
-- `QQ号`：目标账号
-- `密钥`：第二步提取的密钥
-- `--src`：源nt_db目录（默认自动检测）
-- `--dst`：输出目录（默认`decrypted_<QQ号>`）
+- 每个 `.db` 前有 1024 字节 QQ 自定义头，解密前剥离
+- PRAGMA 顺序：`cipher_page_size` → `key` → `kdf_iter` → `cipher_hmac_algorithm` → `cipher_kdf_algorithm`
+- **HMAC 算法以数据库头部声明为准**（本机实测为 `HMAC_SHA1`），并与 `HMAC_SHA512` 等组合一起自动探测
+- 密钥以 **原始 16 字节** 作为口令；hex 文本形式仅作兼容兜底
+- 默认合并 `-wal`，避免丢失最新消息
+- 先写 `.tmp` 再原子替换，失败不会破坏上一次的解密结果
 
-**关键PRAGMA设置**（QQ 9.9.x）：
-```
-cipher_page_size=4096 → key → kdf_iter=4000 → cipher_hmac_algorithm=HMAC_SHA512 → cipher_kdf_algorithm=PBKDF2_HMAC_SHA512
-```
-注意：不是HMAC_SHA1！教程和nt_msg_db_util中的SHA1配置会导致HMAC校验失败。
+密钥也可用环境变量：`$env:QQNT_DB_KEY = "..."`。
 
-每个数据库文件有1024字节自定义头部（"SQLite header 3" + "QQ_NT DB"），解密前需剥离。
+### 第四步：导出聊天记录
 
-### 第四步：导出C2C聊天记录（TXT/MD/JSON）
-
-```bash
-python scripts/export_messages.py <decrypted_nt_msg.db> <对方QQ号> <输出目录> [--format all]
+```powershell
+python scripts/export_messages.py <解密后的 nt_msg.db> <对方QQ号> <输出目录> --format all --my-qq <自己的QQ号>
+python scripts/export_messages.py --list-peers
+python scripts/export_messages.py --account <自己QQ> --peer <对方QQ>
 ```
 
-参数：
-- `db_path`：解密后的 nt_msg.db 路径
-- `peer_qq`：对方 QQ 号
-- `output_dir`：输出目录
-- `--format`：`all`（默认）/ `txt` / `md` / `json`
-- `--my-qq`：自己的 QQ 号（写入 JSON 的 meta 字段）
-
-**为什么不用QQNT_Export工具**：QQNT_Export的`num_to_uid()`从`nt_uid_mapping_table`列48902读取掩码UID（`u_***********_QQ号`），但消息表`c2c_msg_table`列40021存储的是真实UID（列48912）。过滤时只匹配到2023年以前的旧消息（那些消息的`interlocutor_num`列40030为NULL，恰好使用了掩码UID）。
-
-本脚本直接SQL查询：`WHERE [40030]=? OR [40021]=?`，同时匹配QQ号和掩码UID，确保提取全部消息。
+参数：`--format`（all/txt/md/json）、`--my-qq`、`--account`、`--tencent-files`、`--qqnt-export`、`--with-paths`、`--bom`、`--list-peers`、`--limit`、`-q`。
 
 ## 数据库结构
 
-详细的表结构、列映射和已知问题见 [references/database_schema.md](references/database_schema.md)。
+详细表结构见 [references/database_schema.md](references/database_schema.md)。
 
 关键点：
-- `c2c_msg_table`列40030=对方QQ号，列40021=对方UID，列40050=时间戳，列40800=protobuf消息体，列40013=发送方向
-- `nt_uid_mapping_table`列48902=掩码UID（勿用于过滤），列48912=真实UID，列1002=QQ号
+- `c2c_msg_table`：`40030` = 对方 QQ 号，`40021` = 对方 UID，`40033` = 发送者 QQ 号，`40050` = 时间戳，`40800` = protobuf 消息体，`40013` = 消息标志
+- `nt_uid_mapping_table`：`1002` = QQ 号，`48902` = UID（本机真实可用的列），`48912` = 备用 UID 列
+- 查询会话：`WHERE [40030] = ? OR [40021] IN (映射表 UID, 以 _QQ 结尾的掩码 UID)`
+- 判方向：`40033 == 自己的 QQ` → 发；`40013 == 3` 且只有提示段 → 系统
+- 消息体：`Elements { repeated Element elements = 40800 }`，`Element.type`：1 文本 / 2 图片 / 3 文件 / 4 语音 / 5 视频 / 6 表情 / 7 引用 / 8 提示 / 9 红包 / 10 应用消息 / 16 聊天记录 / 21 通话 / 26 动态
 
 ## 依赖
 
-- `sqlcipher3`（系统预装；`pysqlcipher3`在Windows上编译失败）
-- `protobuf==6.31.1`
-- `tqdm`、`lxml`、`humanize`、`SQLAlchemy`、`jinja2`（QQNT_Export 导入链）
-- `pillow`、`mutagen`（图片/语音元素解析）
-- QQNT_Export的`element_pb2.py`用于解析protobuf消息体（脚本中已硬编码路径，可按需修改）
-
-v2 的 `check_deps.py` 会自动检查并安装以上全部依赖。
+- **必需**：`sqlcipher3`（Python 绑定，Windows 有官方 wheel）
+- **可选**：QQNT_Export 的 `emojis.py`（把系统表情显示成中文名）
+- **不需要**：protobuf（内置解码器）、lxml、humanize、SQLAlchemy、jinja2、pillow、mutagen
 
 ## 常见问题
 
-**Q: 解密提示HMAC校验失败？**
-A: 确认使用HMAC_SHA512而非SHA1，且PRAGMA顺序正确（cipher_page_size必须在key之前）。
+**Q: 解密报"尝试了 N 种密钥/参数组合仍无法读取数据库"？**
+A: 密钥过期（QQ 重装/升级会换密钥）。重新运行 `get_key_hex.ps1`。用 `decrypt_db.py --list` 可看到数据库头部声明的格式版本与 HMAC 算法。
 
-**Q: 导出的消息只有几十条？**
-A: QQNT_Export的UID映射bug。使用本skill的`export_messages.py`直接SQL查询。
+**Q: 装 sqlcipher3 总是失败？**
+A: 用 `python -m pip install sqlcipher3`；`sqlcipher3-binary` 没有 Windows 轮子。失败时检查 Python 版本（3.10–3.13 有 wheel）与 VC++ 运行库。
 
-**Q: 密钥中有`?`字符？**
-A: 正常。密钥可能包含字面`?`（0x3F）。用hex输出版本确认字节。
+**Q: 提取密钥提示"检测到 QQ 正在运行"？**
+A: 必须先完全退出 QQ。QQ 拒绝第三方调试器附加（`DebugActiveProcess` 返回错误 31），只能由脚本自己启动 QQ。
 
-**Q: 不知道对方账号密码？**
-A: 不需要。两人之间的C2C对话存储在自己账号的本地数据库中，只需解密自己账号的数据库即可。
+**Q: 导出消息变少/少了最近几天？**
+A: ① 用 `-Force` 重新解密；② 确认选择了正确账号；③ 最新消息可能在 `-wal` 中（v3 默认合并，但源库需可复制）。
 
-**Q: check_deps.py 提示 QQNT_Export 找不到？**
-A: 运行 `install.ps1` 即可自动从 GitHub 下载 QQNT_Export。或手动下载 https://github.com/Tealina28/QQNT_Export 并放在 `D:\Users\Administrator\Desktop\QQNT_output\QQNT_Export`，通过 `--qqnt-export` 参数指定路径。该目录需包含 `element_pb2.py`。
+**Q: 表情只显示编号？**
+A: 安装可选组件 QQNT_Export（`install.ps1` 自动下载 `emojis.py`）。
 
-**Q: 依赖安装失败怎么办？**
-A: 手动运行 `python -m pip install <包名>`，或检查网络/代理设置。`sqlcipher3` 在 Windows 上优先安装 `sqlcipher3-binary`（预编译 wheel），若失败需安装 Visual C++ Build Tools 后再 `pip install sqlcipher3`。
+**Q: PowerShell 脚本中文乱码/解析失败？**
+A: `.ps1` 必须是 UTF-8 **带 BOM**。`selftest.py` 会检查所有脚本的 BOM 与语法。
 
-**Q: 如何部署到新电脑？**
-A: 解压 zip 后进入 scripts 目录，运行 `install.ps1` 即可自动完成 Python 安装、QQNT_Export 下载和全部依赖安装。详见"部署到新电脑"章节。
+**Q: 怎么验证改动没破坏功能？**
+A: `python scripts/selftest.py`（13 项，含合成加密库的完整解密→导出流程；没有 sqlcipher3 时相关项 SKIP）。
 
 ## 版本变更记录
 
-| 项目 | v1 | v2.0 | v2.1 | v2.2（当前） |
-|------|----|------|------|-------------|
-| 依赖检查 | 无 | check_deps.py | 同 v2.0 | 同 v2.0 |
-| 一键部署 | 无 | 无 | 无 | **install.ps1 自动装 Python+QQNT_Export+依赖** |
-| 入口方式 | 手动4步 | run_export.ps1 | 同 v2.0 | 同 v2.0 |
-| 账号检测 | 手动指定 | 自动检测 | 同 v2.0 | 同 v2.0 |
-| 输出格式 | TXT + PDF | TXT + PDF | TXT / MD / JSON | 同 v2.1 |
-| PDF 生成 | chat_to_pdf.py | 保留 | 已移除 | 已移除 |
-| 多格式导出 | 无 | 无 | export_messages.py | 同 v2.1 |
+| 项目 | v2.0 | v2.2 | v3.0（当前） |
+|------|------|------|-------------|
+| 依赖检查 | check_deps.py | 同 v2.0 | 重写：必需/可选分离、`--json`、注册表探测 |
+| 一键部署 | 无 | install.ps1 | 重写：TLS 1.2、真实 Python 校验、Windows wheel |
+| 入口方式 | run_export.ps1 | 同 v2.0 | 重写：密钥走文件、退出码、复用已解密库 |
+| 密钥提取 | PowerShell 逐字节扫描 | 同 v2.0 | C# 实现（0.3 秒）、CONTEXT 修正、R9 取长度、超时/附加 |
+| 解密参数 | HMAC_SHA512（错误） | 同 v2.0 | 头部读取 + 自动探测（含 HMAC_SHA1） |
+| 密钥形式 | hex 文本当口令 | 同 v2.0 | 原始字节口令 + 兼容形式 |
+| 消息解析 | QQNT_Export + element_pb2 | 同 v2.0 | 内置 protobuf 解码器（零依赖） |
+| 消息过滤 | 掩码 UID（bug） | 直接 SQL（仍有掩码写死） | QQ 号 + 真实 UID + 掩码并集 |
+| 收发方向 | 仅 40013 | 同 v2.0 | 优先 40033 发送者号码 |
+| 最新消息 | 忽略 WAL | 同 v2.0 | 合并 WAL |
+| 输出格式 | TXT + PDF | TXT / MD / JSON | TXT / MD / JSON + 统计 + 消息 ID |
+| 自动化测试 | 无 | 无 | selftest.py 13 项 |
